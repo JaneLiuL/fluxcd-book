@@ -8,6 +8,8 @@ Kustomize controller 跟其他的operator一样，也是维持actual state --> d
 
 
 
+
+
 # 问题
 
 我在看源码之前，想了一下，有两个问题是我比较关心的：
