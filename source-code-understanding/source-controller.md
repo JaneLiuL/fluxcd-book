@@ -1,4 +1,95 @@
-## reconcile
+# Overview
+
+source-controller 是Kubernetes的一个Operator， 其实是定义了外部来源包括Git, Helm Repository 和S3 bucket。
+
+实际上，source-controller 在 Fluxcd是作为一个生产者而存在的，他提供给其他controller artifact的来源。并且所有的认证（username/password， SSH等）是在source-controller来做控制。
+
+![](../images/source-controller-overview.png)
+
+
+
+# 功能
+
+1. 对源进行身份验证(SSH、用户/密码、API令牌)
+
+2. 验证源真实性(PGP)
+
+3. 基于更新策略(semver)检测源更改
+
+4. 按需和按时间表获取资源
+
+5. 将获取的资源打包成众所周知的格式(tar.gz, yaml)
+
+6. 使artifacts可以i通过sha或者version来寻址
+
+7. 使相关第三方可以在集群中使用工件
+
+8. 通知感兴趣的第三方源的更改和可用性(status conditions、events、hooks)
+
+9. 响应Git push和Helm chart upload事件(通过notification-controller)
+
+# 数据结构
+
+## Artifact
+
+所有类型的source都需要使用到的一个数据结构。 这个数据是跟其他controller里面helm controller 或者 kustomize controller交换所使用的。
+
+gitrepository 和 helmrepository 以及bucket 都会在Status使用Artifact 来记录artifact信息，以供其他controller下载。
+
+```go
+type Artifact struct {
+	// Path是该工件的相对文件路径 +required
+	Path string `json:"path"`
+	
+	// artifact 的HTTP 地址 +required
+	URL string `json:"url"`
+
+	// 它可以是一个Git commit SHA，一个Git tag，一个Helm index timestamp，一个Helm chart版本，等等。 +optional
+	Revision string `json:"revision"`
+
+	// +optional
+	Checksum string `json:"checksum"`
+
+	// 上一次更新这个artifact的timestamp  +required
+	LastUpdateTime metav1.Time `json:"lastUpdateTime,omitempty"`
+}
+```
+
+
+
+### 接口
+
+所有类型：gitrepository/ helmrepository/ bucket 都要实现Source的接口，去让其他controller 通过GetArtifact/ GetInterval 
+
+```go
+type Source interface {
+	// GetArtifact returns the latest artifact from the source if present in the
+	// status sub-resource.
+	GetArtifact() *Artifact
+	// GetInterval returns the interval at which the source is updated.
+	GetInterval() metav1.Duration
+}
+```
+
+
+
+## gitrepository 
+
+
+
+## helmrepository
+
+## bucket
+
+
+
+
+
+# Reconcile
+
+
+
+## gitrepository reconcile
 
 1. 新建/data/repository.Name 目录，用于保存git clone下来的代码
 2. 如果`repository.Spec.SecretRef` 非空，则先获取该git repo的认证方式，然后确保在该namespace下能获取到同名的secret，否则就返回NotReady报错。也就是说，如果我们使用的git repo是需要验证的，那么需要在该namespace下先创建secret

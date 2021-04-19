@@ -124,8 +124,7 @@ type HelmReleaseSpec struct {
    1. 查询source的status.artifact.url
    2. 尝试使用http 去下载status.artifact.url获取artifact ， 其实这个artifact就是index.yaml
    3. 下载helm chart的tgz包
-7. 调和Helm release 
-   1. 
+7. 执行`reconcileRelease`调和Helm release 
 
 ```go
 func (r *HelmReleaseReconciler) reconcile(ctx context.Context, hr v2.HelmRelease) (v2.HelmRelease, ctrl.Result, error) {
@@ -194,6 +193,132 @@ func (r *HelmReleaseReconciler) reconcile(ctx context.Context, hr v2.HelmRelease
 ```
 
 
+
+`reconcileRelease` 调和helm release的工作流程如下：
+
+1. 初始化helm action runner
+2. 查询上一次release的revision
+3. 注册当前release 
+4. 检查之前所有release的状态
+5. 部署helm release
+   1. 当ref 为空，那么是执行helm install 
+   2. 当ref 不为空，那么是执行helm upgrade
+6. 如果存在一个更新的release revision
+
+```go
+func (r *HelmReleaseReconciler) reconcileRelease(ctx context.Context,
+	hr v2.HelmRelease, chart *chart.Chart, values chartutil.Values) (v2.HelmRelease, error) {
+	log := logr.FromContext(ctx)
+
+	// 初始化helm action runner
+	getter, err := r.getRESTClientGetter(ctx, hr)
+	if err != nil {
+		...
+	}
+	run, err := runner.NewRunner(getter, hr.GetStorageNamespace(), log)
+	if err != nil {
+		..
+	}
+
+	// 查询上一次release的revision
+	rel, observeLastReleaseErr := run.ObserveLastRelease(hr)
+	if observeLastReleaseErr != nil {
+		..
+	}
+
+	// 注册当前release 
+	revision := chart.Metadata.Version
+	releaseRevision := util.ReleaseRevision(rel)
+	valuesChecksum := util.ValuesChecksum(values)
+	hr, hasNewState := v2.HelmReleaseAttempted(hr, revision, releaseRevision, valuesChecksum)
+	if hasNewState {
+		...
+	}
+
+	// 检查release之前所有的状态
+	released := apimeta.FindStatusCondition(hr.Status.Conditions, v2.ReleasedCondition)
+	if released != nil {
+		switch released.Status {
+		// Succeed if the previous release attempt succeeded.
+		case metav1.ConditionTrue:
+			return v2.HelmReleaseReady(hr), nil
+		case metav1.ConditionFalse:
+			// Fail if the previous release attempt remediation failed.
+			remediated := apimeta.FindStatusCondition(hr.Status.Conditions, v2.RemediatedCondition)
+			if remediated != nil && remediated.Status == metav1.ConditionFalse {
+				err = fmt.Errorf("previous release attempt remediation failed")
+				return v2.HelmReleaseNotReady(hr, remediated.Reason, remediated.Message), err
+			}
+		}
+
+		// Fail if install retries are exhausted.
+		if hr.Spec.GetInstall().GetRemediation().RetriesExhausted(hr) {
+			err = fmt.Errorf("install retries exhausted")
+			return v2.HelmReleaseNotReady(hr, released.Reason, err.Error()), err
+		}
+
+		// Fail if there is a release and upgrade retries are exhausted.
+		// This avoids failing after an upgrade uninstall remediation strategy.
+		if rel != nil && hr.Spec.GetUpgrade().GetRemediation().RetriesExhausted(hr) {
+			err = fmt.Errorf("upgrade retries exhausted")
+			return v2.HelmReleaseNotReady(hr, released.Reason, err.Error()), err
+		}
+	}
+
+	// 部署helm release
+	var deployAction v2.DeploymentAction
+	if rel == nil {
+		r.event(ctx, hr, revision, events.EventSeverityInfo, "Helm install has started")
+		deployAction = hr.Spec.GetInstall()
+		rel, err = run.Install(hr, chart, values)
+		err = r.handleHelmActionResult(ctx, &hr, revision, err, deployAction.GetDescription(),
+			v2.ReleasedCondition, v2.InstallSucceededReason, v2.InstallFailedReason)
+	} else {
+		r.event(ctx, hr, revision, events.EventSeverityInfo, "Helm upgrade has started")
+		deployAction = hr.Spec.GetUpgrade()
+		rel, err = run.Upgrade(hr, chart, values)
+		err = r.handleHelmActionResult(ctx, &hr, revision, err, deployAction.GetDescription(),
+			v2.ReleasedCondition, v2.UpgradeSucceededReason, v2.UpgradeFailedReason)
+	}
+	remediation := deployAction.GetRemediation()
+
+	// 如果存在一个更新的release revision
+	if util.ReleaseRevision(rel) > releaseRevision {
+		// Ensure release is not marked remediated.
+		apimeta.RemoveStatusCondition(&hr.Status.Conditions, v2.RemediatedCondition)
+
+		// If new release revision is successful and tests are enabled, run them.
+		if err == nil && hr.Spec.GetTest().Enable {
+			_, testErr := run.Test(hr)
+			testErr = r.handleHelmActionResult(ctx, &hr, revision, testErr, "test",
+				v2.TestSuccessCondition, v2.TestSucceededReason, v2.TestFailedReason)
+
+			// Propagate any test error if not marked ignored.
+			if testErr != nil && !remediation.MustIgnoreTestFailures(hr.Spec.GetTest().IgnoreFailures) {
+				testsPassing := apimeta.FindStatusCondition(hr.Status.Conditions, v2.TestSuccessCondition)
+				meta.SetResourceCondition(&hr, v2.ReleasedCondition, metav1.ConditionFalse, testsPassing.Reason, testsPassing.Message)
+				err = testErr
+			}
+		}
+	}
+
+	if err != nil {
+		...
+	}
+
+	hr.Status.LastReleaseRevision = util.ReleaseRevision(rel)
+
+	if err != nil {
+		reason := meta.ReconciliationFailedReason
+		if condErr := (*ConditionError)(nil); errors.As(err, &condErr) {
+			reason = condErr.Reason
+		}
+		return v2.HelmReleaseNotReady(hr, reason, err.Error()), err
+	}
+	return v2.HelmReleaseReady(hr), nil
+}
+
+```
 
 
 
