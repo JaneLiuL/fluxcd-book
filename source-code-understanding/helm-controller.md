@@ -120,9 +120,12 @@ type HelmReleaseSpec struct {
       6. HR.Spec.Chart.Spec.ValuesFile 不等于 helm chart.Spec.ValuesFile
 4. 检查chart的readiness 
 5. 检查依赖
-6. 从artifact 中获取chart
-7. 调和Helm release
-8. 
+6. 从source controller 的artifact 中获取chart
+   1. 查询source的status.artifact.url
+   2. 尝试使用http 去下载status.artifact.url获取artifact ， 其实这个artifact就是index.yaml
+   3. 下载helm chart的tgz包
+7. 调和Helm release 
+   1. 
 
 ```go
 func (r *HelmReleaseReconciler) reconcile(ctx context.Context, hr v2.HelmRelease) (v2.HelmRelease, ctrl.Result, error) {
@@ -150,53 +153,36 @@ func (r *HelmReleaseReconciler) reconcile(ctx context.Context, hr v2.HelmRelease
 		...
 	}
 
-	// Reconcile chart based on the HelmChartTemplate
+	// 基于HelmChartTemplate 去调和 chart  
 	hc, reconcileErr := r.reconcileChart(ctx, &hr)
 	if reconcileErr != nil {
 		...
 	}
 
-	// Check chart readiness
+	// 检查chart的readiness 
 	if hc.Generation != hc.Status.ObservedGeneration || !apimeta.IsStatusConditionTrue(hc.Status.Conditions, meta.ReadyCondition) {
-		msg := fmt.Sprintf("HelmChart '%s/%s' is not ready", hc.GetNamespace(), hc.GetName())
-		r.event(ctx, hr, hr.Status.LastAttemptedRevision, events.EventSeverityInfo, msg)
-		log.Info(msg)
-		// Do not requeue immediately, when the artifact is created
-		// the watcher should trigger a reconciliation.
-		return v2.HelmReleaseNotReady(hr, v2.ArtifactFailedReason, msg), ctrl.Result{RequeueAfter: hc.Spec.Interval.Duration}, nil
+		..
 	}
 
-	// Check dependencies
+	// 检查依赖
 	if len(hr.Spec.DependsOn) > 0 {
-		if err := r.checkDependencies(hr); err != nil {
-			msg := fmt.Sprintf("dependencies do not meet ready condition (%s), retrying in %s",
-				err.Error(), r.requeueDependency.String())
-			r.event(ctx, hr, hc.GetArtifact().Revision, events.EventSeverityInfo, msg)
-			log.Info(msg)
-
-			// Exponential backoff would cause execution to be prolonged too much,
-			// instead we requeue on a fixed interval.
-			return v2.HelmReleaseNotReady(hr,
-				meta.DependencyNotReadyReason, err.Error()), ctrl.Result{RequeueAfter: r.requeueDependency}, nil
-		}
-		log.Info("all dependencies are ready, proceeding with release")
+		...
 	}
 
 	// Compose values
 	values, err := r.composeValues(ctx, hr)
 	if err != nil {
-		r.event(ctx, hr, hr.Status.LastAttemptedRevision, events.EventSeverityError, err.Error())
-		return v2.HelmReleaseNotReady(hr, v2.InitFailedReason, err.Error()), ctrl.Result{Requeue: true}, nil
+		...
 	}
 
-	// Load chart from artifact
+	//从source controller 的artifact 中获取chart
 	chart, err := r.loadHelmChart(hc)
 	if err != nil {
 		r.event(ctx, hr, hr.Status.LastAttemptedRevision, events.EventSeverityError, err.Error())
 		return v2.HelmReleaseNotReady(hr, v2.ArtifactFailedReason, err.Error()), ctrl.Result{Requeue: true}, nil
 	}
 
-	// Reconcile Helm release
+	// 调和Helm release
 	reconciledHr, reconcileErr := r.reconcileRelease(ctx, *hr.DeepCopy(), chart, values)
 	if reconcileErr != nil {
 		r.event(ctx, hr, hc.GetArtifact().Revision, events.EventSeverityError,
@@ -204,6 +190,54 @@ func (r *HelmReleaseReconciler) reconcile(ctx context.Context, hr v2.HelmRelease
 	}
 	return reconciledHr, ctrl.Result{RequeueAfter: hr.Spec.Interval.Duration}, reconcileErr
 }
+
+```
+
+
+
+
+
+# 附录
+
+以下是HelmRepository 的输出yaml
+
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1beta1
+kind: HelmRepository
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {...}
+  creationTimestamp: "2021-04-16T07:26:08Z"
+  finalizers:
+  - finalizers.fluxcd.io
+  generation: 3  
+  name: xx-name
+  namespace: namespace-xx
+  resourceVersion: "47211"
+  selfLink: /apis/source.toolkit.fluxcd.io/v1beta1/namespaces/namespace-xx/helmrepositories/xx-name
+  uid: b4850faf-814f-4870-a857-bc983c6234e4
+spec:
+  interval: 5m
+  secretRef:
+    name: helm-secret
+  timeout: 1m0s
+  url: https://xx/helm-virtual/
+status:
+  artifact:
+    checksum: 0dbc36ccf6b73da56143600c23b4c6cc5e476b8f
+    lastUpdateTime: "2021-04-16T10:11:12Z"
+    path: helmrepository/namespace-xx/xx-name/index-0dbc36ccf6b73da56143600c23b4c6cc5e476b8f.yaml
+    revision: 0dbc36ccf6b73da56143600c23b4c6cc5e476b8f
+    url: http://source-controller.flux-system.svc.cluster.local./helmrepository/namespace-xx/xx-name/index-0dbc36ccf6b73da56143600c23b4c6cc5e476b8f.yaml
+  conditions:
+  - lastTransitionTime: "2021-04-16T08:12:52Z"
+    message: 'Fetched revision: 0dbc36ccf6b73da56143600c23b4c6cc5e476b8f'
+    reason: IndexationSucceed
+    status: "True"
+    type: Ready
+  observedGeneration: 3
+  url: http://source-controller.flux-system.svc.cluster.local./helmrepository/namespace-xx/xx-name/index.yaml
 
 ```
 
