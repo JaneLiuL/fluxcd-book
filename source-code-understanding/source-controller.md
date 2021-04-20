@@ -75,21 +75,115 @@ type Source interface {
 
 ## gitrepository 
 
+值得注意如下事情：
+
+1. Spec.URL 必须是`^(http|https|ssh)://`  pattern 
+2. SecretRef 是k8s 的secret name， 如果是git ssh认证的secret 必须要包含`identity`, `identity.pub ` 和 `known_hosts`
+3. Interval 是定期调和时间
+4. Timeout 是git 操作的超时时间
+5. Reference 是git repo的特定版本：可以是branch 或者Tag 或者Commit
+
+```go
+// GitRepository is the Schema for the gitrepositories API
+type GitRepository struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   GitRepositorySpec   `json:"spec,omitempty"`
+	Status GitRepositoryStatus `json:"status,omitempty"`
+}
+
+// GitRepositorySpec defines the desired state of a Git repository.
+type GitRepositorySpec struct {
+	// The repository URL, can be a HTTP/S or SSH address.
+	// +kubebuilder:validation:Pattern="^(http|https|ssh)://"
+	// +required
+	URL string `json:"url"`
+
+	// The secret name containing the Git credentials.
+	// For HTTPS repositories the secret must contain username and password
+	// fields.
+	// For SSH repositories the secret must contain identity, identity.pub and
+	// known_hosts fields.
+	// +optional
+	SecretRef *meta.LocalObjectReference `json:"secretRef,omitempty"`
+
+	// +required
+	Interval metav1.Duration `json:"interval"`
+
+	Timeout *metav1.Duration `json:"timeout,omitempty"`
+	
+    // git的reference， 可以是branch 或者tag 或者Commit  +optional
+	Reference *GitRepositoryRef `json:"ref,omitempty"`
+
+	// Verify OpenPGP signature for the Git commit HEAD points to.
+	// +optional
+	Verification *GitRepositoryVerification `json:"verify,omitempty"`
+	// 默认，任何.git  ,jpg之类的文件扩展都是默认被execude的  
+	Ignore *string `json:"ignore,omitempty"`
+
+	Suspend bool `json:"suspend,omitempty"`
+
+	// Determines which git client library to use.
+	// Defaults to go-git, valid values are ('go-git', 'libgit2').
+	// +kubebuilder:validation:Enum=go-git;libgit2
+	// +kubebuilder:default:=go-git
+	// +optional
+	GitImplementation string `json:"gitImplementation,omitempty"`
+}
+```
+
 
 
 ## helmrepository
 
+值得注意的是Helm repository 认证的secret,  如果是HTTP/S的认证就必须要包含username 跟password的 field 。 如果是TLS的secret 必须要包含certFile和keyFile，caCert是optional的
+
+```go
+// HelmRepository is the Schema for the helmrepositories API
+type HelmRepository struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   HelmRepositorySpec   `json:"spec,omitempty"`
+	Status HelmRepositoryStatus `json:"status,omitempty"`
+}
+
+// HelmRepositorySpec defines the reference to a Helm repository.
+type HelmRepositorySpec struct {
+	// The Helm repository URL, a valid URL contains at least a protocol and host.
+	// +required
+	URL string `json:"url"`
+	
+	// Helm repository 认证的secret,  如果是HTTP/S的认证就必须要包含username 跟password的 field 。 如果是TLS的secret 必须要包含certFile和keyFile，caCert是optional的  +optional
+	SecretRef *meta.LocalObjectReference `json:"secretRef,omitempty"`
+
+	Interval metav1.Duration `json:"interval"`
+
+	Timeout *metav1.Duration `json:"timeout,omitempty"`
+
+	Suspend bool `json:"suspend,omitempty"`
+}
+
+```
+
+
+
 ## bucket
 
+先跳过
 
+```go
+
+```
 
 
 
 # Reconcile
 
-
-
 ## gitrepository reconcile
+
+工作流程如下（忽略Finalizer和Deletetimestamp的流程）：
 
 1. 新建/data/repository.Name 目录，用于保存git clone下来的代码
 2. 如果`repository.Spec.SecretRef` 非空，则先获取该git repo的认证方式，然后确保在该namespace下能获取到同名的secret，否则就返回NotReady报错。也就是说，如果我们使用的git repo是需要验证的，那么需要在该namespace下先创建secret
