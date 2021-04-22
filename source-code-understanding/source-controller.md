@@ -179,6 +179,82 @@ type HelmRepositorySpec struct {
 
 
 
+# main
+
+```go
+func main() {
+...
+	// 解析参数
+	flag.Parse()
+	...
+	// 设置监控namespace
+	watchNamespace := ""
+	if !watchAllNamespaces {
+		watchNamespace = os.Getenv("RUNTIME_NAMESPACE")
+	}
+
+	restConfig := client.GetConfigOrDie(clientOptions)
+    // 实例化mgr
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
+		Scheme:                        scheme,
+		MetricsBindAddress:            metricsAddr,
+		HealthProbeBindAddress:        healthAddr,
+		...
+	})
+	
+	if storageAdvAddr == "" {
+		storageAdvAddr = determineAdvStorageAddr(storageAddr, setupLog)
+	}
+    // 新建 storage-path，设置权限777
+	storage := mustInitStorage(storagePath, storageAdvAddr, setupLog)
+
+    // 实例化 GitRepositoryReconciler, HelmRepositoryReconciler, HelmChartReconciler, BucketReconciler
+	if err = (&controllers.GitRepositoryReconciler{
+		Client:                mgr.GetClient(),
+		Scheme:                mgr.GetScheme(),
+		Storage:               storage,
+		EventRecorder:    ...
+	}
+	if err = (&controllers.HelmRepositoryReconciler{
+		Client:                mgr.GetClient(),
+		Scheme:                mgr.GetScheme(),
+		Storage:               storage,
+		Getters:               getters,
+		...
+	}
+	if err = (&controllers.HelmChartReconciler{
+		Client:                mgr.GetClient(),
+		Scheme:                mgr.GetScheme(),
+		Storage:               storage,
+		Getters:               getters,
+		...
+	}
+	if err = (&controllers.BucketReconciler{
+		Client:                mgr.GetClient(),
+		Scheme:                mgr.GetScheme(),
+		Storage:               storage,
+		...
+	}
+
+
+	go func() {
+		// 阻塞，直到选举完成
+		<-mgr.Elected()
+		// 在storage path 启动HTTP 服务，提供http服务
+		startFileServer(storage.BasePath, storageAddr, setupLog)
+	}()
+
+	setupLog.Info("starting manager")
+    // 启动mgr
+	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+		setupLog.Error(err, "problem running manager")
+		os.Exit(1)
+	}
+}
+```
+
+
+
 # Reconcile
 
 ## gitrepository reconcile
@@ -192,12 +268,12 @@ type HelmRepositorySpec struct {
    3. 验证secret， 如果是属于`BasicAuth` 类型 ， 那么尝试获取secret 的username和password data, 如果是属于 KeyAuth  那么久尝试获取CAFile 
 3. 根据spec.GitImplementation 决定使用哪个go git client
 4. 尝试`checkout`操作，并且获取git commit
-5. 实例化`artifact`对象，创建该artifact的目录，revision。 如果该artifact有revision那么设置Ready状态
+5. 实例化`artifact`对象，创建该artifact的目录，revision。 如果该artifact有revision那么设置Ready状态。 设置一个artifact.URL是`fmt.Sprintf("http://%s/%s", s.Hostname, artifact.Path)`
 6. 如果传入的GitRepository对象有要求设置校验PGP（也就是.Spec.Verification不为空）， 那么尝试校验
 7. 创建artifact目录 /data/gitrepository/namespacexxx/gitrepository.name/
 8. 在artifact目录下创建一个跟artifact path同名的.lock文件
 9. tarball压缩整个目录（忽略那些excludefiles）放在artifact目录下， 如果成功就设置artifact数据的checksum和LastUpdateTime
-10. 创建/更新最新的软链接，latest.tar.gz链接到压缩的artifact
+10. 创建/更新最新的软链接，latest.tar.gz链接到压缩的artifact。 **因为刚刚上面我们讲了，我们已经在storage path提供了HTTP服务，因此这个目录里面的所有文件都可以被下载。**
 11. 尝试删除artifact path的.lock文件
 12. 删除/data/repository.Name  目录
 
@@ -303,9 +379,101 @@ func (r *GitRepositoryReconciler) reconcile(ctx context.Context, repository sour
 
 
 
-## helmrepository
+## helmrepository reconcile
+
+工作流程如下（忽略Finalizer和Deletetimestamp的流程）：
+
+1. 如果`repository.Spec.SecretRef` 非空，
 
 ```go
+func (r *HelmRepositoryReconciler) reconcile(ctx context.Context, repository sourcev1.HelmRepository) (sourcev1.HelmRepository, error) {
+	var clientOpts []getter.Option
+	if repository.Spec.SecretRef != nil {
+		name := types.NamespacedName{
+			Namespace: repository.GetNamespace(),
+			Name:      repository.Spec.SecretRef.Name,
+		}
+
+		var secret corev1.Secret
+		err := r.Client.Get(ctx, name, &secret)
+		if err != nil {
+			err = fmt.Errorf("auth secret error: %w", err)
+			return sourcev1.HelmRepositoryNotReady(repository, sourcev1.AuthenticationFailedReason, err.Error()), err
+		}
+
+		opts, cleanup, err := helm.ClientOptionsFromSecret(secret)
+		if err != nil {
+			err = fmt.Errorf("auth options error: %w", err)
+			return sourcev1.HelmRepositoryNotReady(repository, sourcev1.AuthenticationFailedReason, err.Error()), err
+		}
+		defer cleanup()
+		clientOpts = opts
+	}
+	clientOpts = append(clientOpts, getter.WithTimeout(repository.Spec.Timeout.Duration))
+
+	chartRepo, err := helm.NewChartRepository(repository.Spec.URL, r.Getters, clientOpts)
+	if err != nil {
+		switch err.(type) {
+		case *url.Error:
+			return sourcev1.HelmRepositoryNotReady(repository, sourcev1.URLInvalidReason, err.Error()), err
+		default:
+			return sourcev1.HelmRepositoryNotReady(repository, sourcev1.IndexationFailedReason, err.Error()), err
+		}
+	}
+	if err := chartRepo.DownloadIndex(); err != nil {
+		err = fmt.Errorf("failed to download repository index: %w", err)
+		return sourcev1.HelmRepositoryNotReady(repository, sourcev1.IndexationFailedReason, err.Error()), err
+	}
+
+	indexBytes, err := yaml.Marshal(&chartRepo.Index)
+	if err != nil {
+		return sourcev1.HelmRepositoryNotReady(repository, sourcev1.StorageOperationFailedReason, err.Error()), err
+	}
+	hash := r.Storage.Checksum(bytes.NewReader(indexBytes))
+	artifact := r.Storage.NewArtifactFor(repository.Kind,
+		repository.ObjectMeta.GetObjectMeta(),
+		hash,
+		fmt.Sprintf("index-%s.yaml", hash))
+	// return early on unchanged index
+	if apimeta.IsStatusConditionTrue(repository.Status.Conditions, meta.ReadyCondition) && repository.GetArtifact().HasRevision(artifact.Revision) {
+		if artifact.URL != repository.GetArtifact().URL {
+			r.Storage.SetArtifactURL(repository.GetArtifact())
+			repository.Status.URL = r.Storage.SetHostname(repository.Status.URL)
+		}
+		return repository, nil
+	}
+
+	// create artifact dir
+	err = r.Storage.MkdirAll(artifact)
+	if err != nil {
+		err = fmt.Errorf("unable to create repository index directory: %w", err)
+		return sourcev1.HelmRepositoryNotReady(repository, sourcev1.StorageOperationFailedReason, err.Error()), err
+	}
+
+	// acquire lock
+	unlock, err := r.Storage.Lock(artifact)
+	if err != nil {
+		err = fmt.Errorf("unable to acquire lock: %w", err)
+		return sourcev1.HelmRepositoryNotReady(repository, sourcev1.StorageOperationFailedReason, err.Error()), err
+	}
+	defer unlock()
+
+	// save artifact to storage
+	if err := r.Storage.AtomicWriteFile(&artifact, bytes.NewReader(indexBytes), 0644); err != nil {
+		err = fmt.Errorf("unable to write repository index file: %w", err)
+		return sourcev1.HelmRepositoryNotReady(repository, sourcev1.StorageOperationFailedReason, err.Error()), err
+	}
+
+	// update index symlink
+	indexURL, err := r.Storage.Symlink(artifact, "index.yaml")
+	if err != nil {
+		err = fmt.Errorf("storage error: %w", err)
+		return sourcev1.HelmRepositoryNotReady(repository, sourcev1.StorageOperationFailedReason, err.Error()), err
+	}
+
+	message := fmt.Sprintf("Fetched revision: %s", artifact.Revision)
+	return sourcev1.HelmRepositoryReady(repository, artifact, indexURL, sourcev1.IndexationSucceededReason, message), nil
+}
 
 ```
 
