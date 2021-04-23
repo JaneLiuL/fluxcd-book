@@ -16,9 +16,9 @@ GitOps 越来越重要， Fluxcd作为GitOps的在CD的一种实现也变得越�
    4. [经验]  
 3. 架构
 4. 源码理解
-   1. source-controller
-   2. kustomize-controller
-   3. helm-controller
+   1.    [source-controller](/source-code-understanding/source-controller.md)
+   2.    [helm-controller](/source-code-understanding/helm-controller.md)
+   3.    [kustomize-controller](/source-code-understanding/kustomize-controller.md)
    4. notification-controller
 5. 测试
    1. 功能测试
