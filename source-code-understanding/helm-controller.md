@@ -110,7 +110,7 @@ type HelmReleaseSpec struct {
 3.  基于HelmChartTemplate 去调和 chart  
    1. 组成chartName: namespace-name
    2. 如果hr.status.HelmChart 不为空，并且 hr.status.HelmChart 不等于chartName ， 那么执行删除helm chart
-   3. 查询是否已经有了同名的helm chart， 如果找不到，那么通过`buildHelmChartFromTemplate` 来构建一个helm chart的数据，再使用client来Create这个对象数据
+   3. 查询是否已经有了同名的helm chart， **这个helm chart是source controller的helmchart 类型**， 如果找不到，那么通过`buildHelmChartFromTemplate` 来构建一个helm chart的数据，再使用client来Create这个对象数据
    4. 在比较HelmRelease跟HelmChart的时候如果发现如下情况，就使用client来Update这个对象数据(helmrelease我们在这里缩写成HR)
       1. HR.Spec.Chart.Spec.Chart 不等于 helm chart.Spec.Chart
       2. HR.Spec.Chart.Spec.Version 是空 并且 helm chart.Spec.Version 不等于 *
