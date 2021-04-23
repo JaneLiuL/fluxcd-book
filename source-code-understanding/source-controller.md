@@ -30,6 +30,20 @@ source-controller 是Kubernetes的一个Operator， 其实是定义了外部来�
 
 # 数据结构
 
+source-controller 安装了四个schema, 如下所示
+
+```
+buckets                                        source.toolkit.fluxcd.io/v1beta1                    true         Bucket
+gitrepositories                                source.toolkit.fluxcd.io/v1beta1                    true         GitRepository
+helmcharts                                     source.toolkit.fluxcd.io/v1beta1                    true         HelmChart
+helmrepositories                               source.toolkit.fluxcd.io/v1beta1                    true         HelmRepository
+
+```
+
+![](../images/source-controller-schema.png)
+
+
+
 ## Artifact
 
 所有类型的source都需要使用到的一个数据结构。 这个数据是跟其他controller里面helm controller 或者 kustomize controller交换所使用的。
@@ -162,6 +176,45 @@ type HelmRepositorySpec struct {
 
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
 
+	Suspend bool `json:"suspend,omitempty"`
+}
+```
+
+
+
+## helmchart
+
+在我看完helmrepository 的reconcile的时候，我惊奇发现，它居然只是提供下载index.yaml的链接，没有下载helm chart的地方，那么helmrelease 文件的source指向到这个helmrepository, 是如何提供下载的呢？？ 
+
+答案是，我在看main函数的时候，有一个叫`HelmChartReconciler` 的调和，于是乎，我就加上`helmchart` 的数据结构，结合reconcile一起看
+
+```go
+// HelmChart is the Schema for the helmcharts API
+type HelmChart struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   HelmChartSpec   `json:"spec,omitempty"`
+	Status HelmChartStatus `json:"status,omitempty"`
+}
+
+// HelmChartSpec defines the desired state of a Helm chart.
+type HelmChartSpec struct {	
+    // 在SourceRef里面的chart name    +required
+	Chart string `json:"chart"`
+
+	// chart的版本  +optional
+	Version string `json:"version,omitempty"`
+
+	// chart的source +required
+	SourceRef LocalHelmChartSourceReference `json:"sourceRef"`
+
+	Interval metav1.Duration `json:"interval"`
+
+	// +optional
+	ValuesFile string `json:"valuesFile,omitempty"`
+
+	// +optional
 	Suspend bool `json:"suspend,omitempty"`
 }
 
@@ -383,7 +436,18 @@ func (r *GitRepositoryReconciler) reconcile(ctx context.Context, repository sour
 
 工作流程如下（忽略Finalizer和Deletetimestamp的流程）：
 
-1. 如果`repository.Spec.SecretRef` 非空，
+1. 如果`repository.Spec.SecretRef` 非空，确保在该namespace下能获取到同名的secret，否则就返回NotReady报错。 
+   1. 尝试获取`Secret.Data["username"]` 和 ·`string(secret.Data["password"]`， 如果获取到的值是非空，那么返回是使用`BasicAuth`， 并且添加`BasicAuth`到`opts`列表中。
+   2. 尝试获取` secret.Data["certFile"]    secret.Data["keyFile"]   secret.Data["caFile"]` ， 如果获取到非空，那么尝试读取值并且写入`cert.crt`和`key.crt` 文件， 并且添加`tlsClientConfig`到`opts`列表中
+2. 实例化`ChartRepository` 
+3. 尝试使用client 下载helm repo里面的index.yaml , 然后加载index文件至`ChartRepository.Index` 中
+4. 尝试使用yaml序列化 `ChartRepository.Index` 
+5. 实例化`artifact`对象，设置一个artifact.URL是`fmt.Sprintf("http://%s/%s", s.Hostname, artifact.Path)`
+6. 创建该artifact的目录
+7. 在artifact目录下创建一个跟artifact path同名的.lock文件
+8. 保存index-<checksum>.yaml 文件到artifact 目录
+9. 创建/更新最新的软链接，index.yaml链接到index-<checksum>.yaml 文件
+10. 在artifact目录下删除.lock文件解锁
 
 ```go
 func (r *HelmRepositoryReconciler) reconcile(ctx context.Context, repository sourcev1.HelmRepository) (sourcev1.HelmRepository, error) {
@@ -397,14 +461,12 @@ func (r *HelmRepositoryReconciler) reconcile(ctx context.Context, repository sou
 		var secret corev1.Secret
 		err := r.Client.Get(ctx, name, &secret)
 		if err != nil {
-			err = fmt.Errorf("auth secret error: %w", err)
-			return sourcev1.HelmRepositoryNotReady(repository, sourcev1.AuthenticationFailedReason, err.Error()), err
+			...
 		}
-
+		// 
 		opts, cleanup, err := helm.ClientOptionsFromSecret(secret)
 		if err != nil {
-			err = fmt.Errorf("auth options error: %w", err)
-			return sourcev1.HelmRepositoryNotReady(repository, sourcev1.AuthenticationFailedReason, err.Error()), err
+			...
 		}
 		defer cleanup()
 		clientOpts = opts
@@ -413,16 +475,11 @@ func (r *HelmRepositoryReconciler) reconcile(ctx context.Context, repository sou
 
 	chartRepo, err := helm.NewChartRepository(repository.Spec.URL, r.Getters, clientOpts)
 	if err != nil {
-		switch err.(type) {
-		case *url.Error:
-			return sourcev1.HelmRepositoryNotReady(repository, sourcev1.URLInvalidReason, err.Error()), err
-		default:
-			return sourcev1.HelmRepositoryNotReady(repository, sourcev1.IndexationFailedReason, err.Error()), err
+		...
 		}
 	}
 	if err := chartRepo.DownloadIndex(); err != nil {
-		err = fmt.Errorf("failed to download repository index: %w", err)
-		return sourcev1.HelmRepositoryNotReady(repository, sourcev1.IndexationFailedReason, err.Error()), err
+		...
 	}
 
 	indexBytes, err := yaml.Marshal(&chartRepo.Index)
@@ -473,6 +530,237 @@ func (r *HelmRepositoryReconciler) reconcile(ctx context.Context, repository sou
 
 	message := fmt.Sprintf("Fetched revision: %s", artifact.Revision)
 	return sourcev1.HelmRepositoryReady(repository, artifact, indexURL, sourcev1.IndexationSucceededReason, message), nil
+}
+
+```
+
+
+
+## HelmChartReconciler
+
+工作流程如下：
+
+1. 尝试在集群中获取该helmchart
+2. 检查finalizer, 如果没有finalizer 那么添加finalizer
+3.  判断应用是否正在被删除， 如果是，那么跳转到删除chart的reconcile
+4. 如果对象enable suspend 就不做任何操作，直接返回
+5. 将status重置
+6. 从storage path中删除chart 
+7. 判断source 是否 ready
+8.  如果source是helmrepository， 那么调用`reconcileFromHelmRepository` 去调和
+9.  如果source是GitRepository 或者Bucket， 那么调用`reconcileFromTarballArtifact` 去调和
+10.  更新这次调和的status
+11. 如果调和失败那么马上重新入队
+12. 等下次internal 时间到再重新入队调和
+
+```go
+func (r *HelmChartReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	...
+	// 尝试在集群中获取该helmchart
+	var chart sourcev1.HelmChart
+	if err := r.Get(ctx, req.NamespacedName, &chart); err != nil {
+		return ctrl.Result{Requeue: true}, client.IgnoreNotFound(err)
+	}
+
+	....
+	// 检查finalizer, 如果没有finalizer 那么添加finalizer
+	if !controllerutil.ContainsFinalizer(&chart, sourcev1.SourceFinalizer) {
+		controllerutil.AddFinalizer(&chart, sourcev1.SourceFinalizer)
+		if err := r.Update(ctx, &chart); err != nil {
+			...
+		}
+	}
+
+	// 判断应用是否正在被删除
+	if !chart.ObjectMeta.DeletionTimestamp.IsZero() {
+		return r.reconcileDelete(ctx, chart)
+	}
+
+	// 如果对象enable suspend 就不做任何操作，直接返回
+	if chart.Spec.Suspend {
+		log.Info("Reconciliation is suspended for this object")
+		return ctrl.Result{}, nil
+	}
+
+	...
+
+    // 将status重置
+	resetChart, changed := r.resetStatus(chart)
+	if changed {
+		chart = resetChart
+		if err := r.updateStatus(ctx, req, chart.Status); err != nil {
+			log.Error(err, "unable to update status")
+			return ctrl.Result{Requeue: true}, err
+		}
+		r.recordReadiness(ctx, chart)
+	}
+
+	...
+
+	// 从storage path中删除chart 
+	if err := r.gc(chart); err != nil {
+		log.Error(err, "unable to purge old artifacts")
+	}
+	
+    // 获取helmchart的source , 是gitrepository 还是helmrepository
+	source, err := r.getSource(ctx, chart)
+	if err != nil {
+		...
+	}
+
+	// 判断source 是否 ready
+	if source.GetArtifact() == nil {
+		...
+	}
+
+	var reconciledChart sourcev1.HelmChart
+	var reconcileErr error
+	switch typedSource := source.(type) {
+        // 如果source是helmrepository， 那么调用`reconcileFromHelmRepository` 去调和
+	case *sourcev1.HelmRepository:
+		// 验证helm chart name
+		if err := validHelmChartName(chart.Spec.Chart); err != nil {
+			...
+			return ctrl.Result{Requeue: false}, nil
+		}
+		reconciledChart, reconcileErr = r.reconcileFromHelmRepository(ctx, *typedSource, *chart.DeepCopy(), changed)
+        // 如果source是GitRepository 或者Bucket， 那么调用`reconcileFromTarballArtifact` 去调和
+	case *sourcev1.GitRepository, *sourcev1.Bucket:
+		reconciledChart, reconcileErr = r.reconcileFromTarballArtifact(ctx, *typedSource.GetArtifact(),
+			*chart.DeepCopy(), changed)
+	default:
+		err := fmt.Errorf("unable to reconcile unsupported source reference kind '%s'", chart.Spec.SourceRef.Kind)
+		return ctrl.Result{Requeue: false}, err
+	}
+	
+    // 更新这次调和的status
+	if err := r.updateStatus(ctx, req, reconciledChart.Status); err != nil {
+		log.Error(err, "unable to update status")
+		return ctrl.Result{Requeue: true}, err
+	}
+
+	// 如果调和失败那么马上重新入队
+	if reconcileErr != nil {
+		...
+		return ctrl.Result{Requeue: true}, reconcileErr
+	}
+
+	// 等下次internal 时间到再重新入队调和
+	return ctrl.Result{RequeueAfter: chart.GetInterval().Duration}, nil
+}
+
+```
+
+### reconcileFromHelmRepository
+
+我们来看看一个具体的source是helmrepository的工作流程：
+
+1.  获取helmrepository 的secret
+2. 构造clientOpts
+3. 构造ChartRepository 对象
+4. 打开indexfile 并且读取index， 加载Index
+5.  在index文件中尝试搜索获取chart name, chart version
+6.  设置status.artifact的url, path, revision
+7. 创建artifact 目录
+8.  在artifact目录创建.lock文件 上锁
+9. 下载helm chart， 下载URL 其实就是从index文件里面找到的URL
+10. 如果helmchart.spec.valuesFile不为空，那么将重新打包helm chart，否则直接写helm chart到artifact 目录中
+11.  创建链接文件
+12. 最后删.lock 文件  解锁
+
+```go
+func (r *HelmChartReconciler) reconcileFromHelmRepository(ctx context.Context,
+	repository sourcev1.HelmRepository, chart sourcev1.HelmChart, force bool) (sourcev1.HelmChart, error) {
+	// Configure ChartRepository getter options
+	var clientOpts []getter.Option
+    // 获取helmrepository 的secret
+	if secret, err := r.getHelmRepositorySecret(ctx, &repository); err != nil {
+		return sourcev1.HelmChartNotReady(chart, sourcev1.AuthenticationFailedReason, err.Error()), err
+	} else if secret != nil {
+		opts, cleanup, err := helm.ClientOptionsFromSecret(*secret)
+		if err != nil {
+			err = fmt.Errorf("auth options error: %w", err)
+			return sourcev1.HelmChartNotReady(chart, sourcev1.AuthenticationFailedReason, err.Error()), err
+		}
+		defer cleanup()
+
+		clientOpts = opts
+	}
+	clientOpts = append(clientOpts, getter.WithTimeout(repository.Spec.Timeout.Duration))
+	
+    // 构造ChartRepository 对象
+	chartRepo, err := helm.NewChartRepository(repository.Spec.URL, r.Getters, clientOpts)
+	if err != nil {
+		...
+	}
+    // 打开indexfile
+	indexFile, err := os.Open(r.Storage.LocalPath(*repository.GetArtifact()))
+	if err != nil {
+		return sourcev1.HelmChartNotReady(chart, sourcev1.StorageOperationFailedReason, err.Error()), err
+	}
+    // 读取index文件
+	b, err := ioutil.ReadAll(indexFile)
+	if err != nil {
+		return sourcev1.HelmChartNotReady(chart, sourcev1.ChartPullFailedReason, err.Error()), err
+	}
+    // 加载Index
+	if err = chartRepo.LoadIndex(b); err != nil {
+		return sourcev1.HelmChartNotReady(chart, sourcev1.ChartPullFailedReason, err.Error()), err
+	}
+
+	// 在index文件中尝试搜索获取chart name, chart version
+	chartVer, err := chartRepo.Get(chart.Spec.Chart, chart.Spec.Version)
+	if err != nil {
+		return sourcev1.HelmChartNotReady(chart, sourcev1.ChartPullFailedReason, err.Error()), err
+	}
+	
+    // 设置status.artifact的url, path, revision
+	newArtifact := r.Storage.NewArtifactFor(chart.Kind, chart.GetObjectMeta(), chartVer.Version,
+		fmt.Sprintf("%s-%s.tgz", chartVer.Name, chartVer.Version))
+	if !force && repository.GetArtifact().HasRevision(newArtifact.Revision) {
+		if newArtifact.URL != chart.GetArtifact().URL {
+			r.Storage.SetArtifactURL(chart.GetArtifact())
+			chart.Status.URL = r.Storage.SetHostname(chart.Status.URL)
+		}
+		return chart, nil
+	}
+	
+    // 创建artifact 目录
+	err = r.Storage.MkdirAll(newArtifact)
+	
+	//  在artifact目录创建.lock文件 上锁
+	unlock, err := r.Storage.Lock(newArtifact)
+	// 最后删.lock 文件  解锁
+	defer unlock()
+
+	// 下载helm chart， 下载URL 其实就是从index文件里面找到的URL
+	res, err := chartRepo.DownloadChart(chartVer)
+
+	var (
+		readyReason  = sourcev1.ChartPullSucceededReason
+		readyMessage = fmt.Sprintf("Fetched revision: %s", newArtifact.Revision)
+	)
+	switch {
+     //  如果helmchart.spec.valuesFile不为空，那么将重新打包helm chart
+	case chart.Spec.ValuesFile != "" && chart.Spec.ValuesFile != chartutil.ValuesfileName:
+		...
+    // 否则直接写helm chart到artifact 目录中
+	default:
+		// Write artifact to storage
+		if err := r.Storage.AtomicWriteFile(&newArtifact, res, 0644); err != nil {
+			err = fmt.Errorf("unable to write chart file: %w", err)
+			return sourcev1.HelmChartNotReady(chart, sourcev1.StorageOperationFailedReason, err.Error()), err
+		}
+	}
+
+	// 创建链接文件
+	chartUrl, err := r.Storage.Symlink(newArtifact, fmt.Sprintf("%s-latest.tgz", chartVer.Name))
+	if err != nil {
+		err = fmt.Errorf("storage error: %w", err)
+		return sourcev1.HelmChartNotReady(chart, sourcev1.StorageOperationFailedReason, err.Error()), err
+	}
+
+	return sourcev1.HelmChartReady(chart, newArtifact, chartUrl, readyReason, readyMessage), nil
 }
 
 ```

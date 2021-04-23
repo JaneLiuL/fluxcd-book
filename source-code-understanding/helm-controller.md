@@ -122,7 +122,7 @@ type HelmReleaseSpec struct {
 5. 检查依赖
 6. 从source controller 的artifact 中获取chart
    1. 查询source的status.artifact.url
-   2. 尝试使用http 去下载status.artifact.url获取artifact ， 其实这个artifact就是index.yaml
+   2. 尝试使用http 去下载status.artifact.url获取artifact 
    3. 下载helm chart的tgz包
 7. 执行`reconcileRelease`调和Helm release 
 
