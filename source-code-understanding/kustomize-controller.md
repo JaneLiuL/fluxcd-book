@@ -6,9 +6,22 @@ Kustomize controller 跟其他的operator一样，也是维持actual state --> d
 
 当来源git repository发生改变，或者本身的kustomization的对象发生改变，比如postBuild的环境变量更改之类，也会被定期同步到K8S中。
 
+![](../images/kustomize-controller-overview.png)
 
+# 功能
 
-
+1. 监控Kustomization对象
+2. 从Source对象获取Source-Controller产生的artifacts
+3. 监视source 对象的revision更改
+4. 如果需要，生成kustomization.yaml文件
+5. 使用kustomize构建生成Kubernetes清单
+6. 使用Mozilla SOPS解密Kubernetes secret
+7. 通过客户端或APIServer dry run验证构建输出
+8. 将生成的manifest apply 于集群
+9. 删除从source 中删除的Kubernetes对象
+10. 检查已部署workload 的运行状况
+11. 考虑到依赖关系，以特定顺序运行Kustomization
+12. 当Kustomization状态更改时通知
 
 # 问题
 
