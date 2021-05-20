@@ -82,7 +82,7 @@ status:
       namespace: xx-telematics
     - kinds:
         kustomize.toolkit.fluxcd.io/v1beta1, Kind=Kustomization: Kustomization
-        onboarding.connectedvehicle.ericsson.net/v1alpha1, Kind=Tenant: Tenant
+        xx.v1alpha1, Kind=Tenant: Tenant
         source.toolkit.fluxcd.io/v1beta1, Kind=GitRepository: GitRepository
       namespace: xx-platform
 ```
