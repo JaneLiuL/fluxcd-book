@@ -449,10 +449,6 @@ func (kgc *KustomizeGarbageCollector) Prune(timeout time.Duration, name string, 
 
 # 总结
 
-
-
-
-
 1. 是否无脑，只要git repo来源有改变，都kubectl apply到集群中？ 
 
    回答： 其实是定期就kubectl apply过去
