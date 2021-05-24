@@ -221,6 +221,8 @@ func (r *KustomizationReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 7. 构建kustomization文件，并且生成GC 的snapshot
 8. 尝试使用 kubectl 命令去dry-run apply测试一下
 9. 正式apply进入集群(我压根没有想到，居然真的是用shell call kubectl apply ...)
+   1. Apply 的时候其实加了一个field-manager 
+   2. 另外，在apply 之后，会把apply 的output  捕获，并且输出到日志
 10. 资源删除（GC）
 11. 健康检查
 
